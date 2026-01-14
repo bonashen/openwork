@@ -1,0 +1,300 @@
+use std::{
+  fs,
+  net::TcpListener,
+  path::{Path, PathBuf},
+  process::{Child, Command, Stdio},
+  sync::Mutex,
+};
+
+use serde::Serialize;
+use tauri::State;
+
+#[derive(Default)]
+struct EngineManager {
+  inner: Mutex<EngineState>,
+}
+
+#[derive(Default)]
+struct EngineState {
+  child: Option<Child>,
+  project_dir: Option<String>,
+  hostname: Option<String>,
+  port: Option<u16>,
+  base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineInfo {
+  pub running: bool,
+  pub base_url: Option<String>,
+  pub project_dir: Option<String>,
+  pub hostname: Option<String>,
+  pub port: Option<u16>,
+  pub pid: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecResult {
+  pub ok: bool,
+  pub status: i32,
+  pub stdout: String,
+  pub stderr: String,
+}
+
+fn find_free_port() -> Result<u16, String> {
+  let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+  let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+  Ok(port)
+}
+
+fn run_capture(command: &mut Command) -> Result<ExecResult, String> {
+  let output = command
+    .output()
+    .map_err(|e| format!("Failed to run command: {e}"))?;
+
+  let status = output.status.code().unwrap_or(-1);
+
+  Ok(ExecResult {
+    ok: output.status.success(),
+    status,
+    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+  })
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
+  if !src.is_dir() {
+    return Err(format!("Source is not a directory: {}", src.display()));
+  }
+
+  fs::create_dir_all(dest).map_err(|e| format!("Failed to create dir {}: {e}", dest.display()))?;
+
+  for entry in fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {e}", src.display()))? {
+    let entry = entry.map_err(|e| e.to_string())?;
+    let file_type = entry.file_type().map_err(|e| e.to_string())?;
+
+    let from = entry.path();
+    let to = dest.join(entry.file_name());
+
+    if file_type.is_dir() {
+      copy_dir_recursive(&from, &to)?;
+      continue;
+    }
+
+    if file_type.is_file() {
+      fs::copy(&from, &to)
+        .map_err(|e| format!("Failed to copy {} -> {}: {e}", from.display(), to.display()))?;
+      continue;
+    }
+
+    // Skip symlinks and other non-regular entries.
+  }
+
+  Ok(())
+}
+
+impl EngineManager {
+  fn snapshot_locked(state: &mut EngineState) -> EngineInfo {
+    let (running, pid) = match state.child.as_mut() {
+      None => (false, None),
+      Some(child) => match child.try_wait() {
+        Ok(Some(_status)) => {
+          // Process exited.
+          state.child = None;
+          (false, None)
+        }
+        Ok(None) => (true, Some(child.id())),
+        Err(_) => (true, Some(child.id())),
+      },
+    };
+
+    EngineInfo {
+      running,
+      base_url: state.base_url.clone(),
+      project_dir: state.project_dir.clone(),
+      hostname: state.hostname.clone(),
+      port: state.port,
+      pid,
+    }
+  }
+
+  fn stop_locked(state: &mut EngineState) {
+    if let Some(mut child) = state.child.take() {
+      let _ = child.kill();
+      let _ = child.wait();
+    }
+    state.base_url = None;
+    state.project_dir = None;
+    state.hostname = None;
+    state.port = None;
+  }
+}
+
+#[tauri::command]
+fn engine_info(manager: State<EngineManager>) -> EngineInfo {
+  let mut state = manager.inner.lock().expect("engine mutex poisoned");
+  EngineManager::snapshot_locked(&mut state)
+}
+
+#[tauri::command]
+fn engine_stop(manager: State<EngineManager>) -> EngineInfo {
+  let mut state = manager.inner.lock().expect("engine mutex poisoned");
+  EngineManager::stop_locked(&mut state);
+  EngineManager::snapshot_locked(&mut state)
+}
+
+#[tauri::command]
+fn engine_start(manager: State<EngineManager>, project_dir: String) -> Result<EngineInfo, String> {
+  let project_dir = project_dir.trim().to_string();
+  if project_dir.is_empty() {
+    return Err("projectDir is required".to_string());
+  }
+
+  let hostname = "127.0.0.1".to_string();
+  let port = find_free_port()?;
+
+  let mut state = manager.inner.lock().expect("engine mutex poisoned");
+
+  // Stop any existing engine first.
+  EngineManager::stop_locked(&mut state);
+
+  let mut command = Command::new("opencode");
+  command
+    .arg("serve")
+    .arg("--hostname")
+    .arg(&hostname)
+    .arg("--port")
+    .arg(port.to_string())
+    // Allow the Vite dev server origin, plus common Tauri origins.
+    .arg("--cors")
+    .arg("http://localhost:5173")
+    .arg("--cors")
+    .arg("tauri://localhost")
+    .arg("--cors")
+    .arg("http://tauri.localhost")
+    .current_dir(&project_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+  let child = command
+    .spawn()
+    .map_err(|e| format!("Failed to start opencode: {e}"))?;
+
+  state.child = Some(child);
+  state.project_dir = Some(project_dir);
+  state.hostname = Some(hostname.clone());
+  state.port = Some(port);
+  state.base_url = Some(format!("http://{hostname}:{port}"));
+
+  Ok(EngineManager::snapshot_locked(&mut state))
+}
+
+#[tauri::command]
+fn opkg_install(project_dir: String, package: String) -> Result<ExecResult, String> {
+  let project_dir = project_dir.trim().to_string();
+  if project_dir.is_empty() {
+    return Err("projectDir is required".to_string());
+  }
+
+  let package = package.trim().to_string();
+  if package.is_empty() {
+    return Err("package is required".to_string());
+  }
+
+  let mut command = Command::new("opkg");
+  command
+    .arg("install")
+    .arg(&package)
+    .current_dir(&project_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+  match command.output() {
+    Ok(output) => {
+      let status = output.status.code().unwrap_or(-1);
+      Ok(ExecResult {
+        ok: output.status.success(),
+        status,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+      })
+    }
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+      // Fallback: use pnpm to download+run opkg on demand.
+      let mut pnpm = Command::new("pnpm");
+      pnpm
+        .arg("dlx")
+        .arg("opkg")
+        .arg("install")
+        .arg(&package)
+        .current_dir(&project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+      run_capture(&mut pnpm)
+    }
+    Err(e) => Err(format!("Failed to run opkg: {e}")),
+  }
+}
+
+#[tauri::command]
+fn import_skill(project_dir: String, source_dir: String, overwrite: bool) -> Result<ExecResult, String> {
+  let project_dir = project_dir.trim().to_string();
+  if project_dir.is_empty() {
+    return Err("projectDir is required".to_string());
+  }
+
+  let source_dir = source_dir.trim().to_string();
+  if source_dir.is_empty() {
+    return Err("sourceDir is required".to_string());
+  }
+
+  let src = PathBuf::from(&source_dir);
+  let name = src
+    .file_name()
+    .and_then(|s| s.to_str())
+    .ok_or_else(|| "Failed to infer skill name from directory".to_string())?;
+
+  let dest = PathBuf::from(&project_dir)
+    .join(".opencode")
+    .join("skill")
+    .join(name);
+
+  if dest.exists() {
+    if overwrite {
+      fs::remove_dir_all(&dest)
+        .map_err(|e| format!("Failed to remove existing skill dir {}: {e}", dest.display()))?;
+    } else {
+      return Err(format!("Skill already exists at {}", dest.display()));
+    }
+  }
+
+  copy_dir_recursive(&src, &dest)?;
+
+  Ok(ExecResult {
+    ok: true,
+    status: 0,
+    stdout: format!("Imported skill to {}", dest.display()),
+    stderr: String::new(),
+  })
+}
+
+pub fn run() {
+  tauri::Builder::default()
+    .plugin(tauri_plugin_dialog::init())
+    .manage(EngineManager::default())
+    .invoke_handler(tauri::generate_handler![
+      engine_start,
+      engine_stop,
+      engine_info,
+      opkg_install,
+      import_skill
+    ])
+    .run(tauri::generate_context!())
+    .expect("error while running OpenWork");
+}
